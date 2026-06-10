@@ -1,0 +1,352 @@
+// CandidateFlow — Prisma Schema
+// Production-grade normalized schema with explicit indexes,
+// soft-delete where appropriate, and full audit trail support.
+//
+// All DateTime columns use `@db.Timestamptz(3)` (timestamp with time zone).
+// This is intentional: the retry scheduler and other time-based queries compare
+// stored timestamps against the database clock (NOW()). With naive
+// `timestamp without time zone` columns, those comparisons silently shift by the
+// server's UTC offset (e.g. America/New_York → 4h), which caused due retry jobs
+// to never be claimed. Timestamptz stores an absolute instant, so comparisons
+// are correct regardless of the session timezone.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+// In Prisma 7, the connection URL is configured in prisma.config.ts (not here).
+// The datasource block only needs the provider.
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────
+
+enum UserRole {
+  RECRUITER
+  ADMIN
+}
+
+enum CandidateStatus {
+  PENDING      // Created, not yet screened
+  SCREENING    // Screening in progress
+  COMPLETED    // Screening completed
+  FAILED       // Screening failed (candidate didn't respond / delivery failed)
+  WITHDRAWN    // Recruiter manually withdrew
+}
+
+enum ScreeningState {
+  PENDING      // Awaiting recruiter to launch
+  STARTED      // Intro message sent, waiting for START reply
+  QUESTION_1
+  QUESTION_2
+  QUESTION_3
+  QUESTION_4
+  COMPLETED
+  FAILED
+}
+
+enum MessageDirection {
+  OUTBOUND     // System → Candidate
+  INBOUND      // Candidate → System
+}
+
+enum MessageStatus {
+  PENDING      // Not yet sent
+  QUEUED       // Accepted by provider
+  SENT         // Provider confirmed sent
+  DELIVERED    // Delivered (iMessage/RCS only — not available for SMS)
+  RECEIVED     // Inbound message received
+  READ         // Read (iMessage only)
+  FAILED       // Terminal failure
+}
+
+enum WebhookEventStatus {
+  RECEIVED     // Received, not yet processed
+  PROCESSING   // Currently being handled
+  PROCESSED    // Successfully handled
+  FAILED       // Processing failed (logged, may retry)
+  DUPLICATE    // Duplicate eventId, skipped
+}
+
+enum RetryJobStatus {
+  PENDING
+  IN_PROGRESS
+  SUCCEEDED
+  DEAD_LETTER  // Exhausted all attempts
+}
+
+enum AuditAction {
+  CANDIDATE_CREATED
+  CANDIDATE_UPDATED
+  CANDIDATE_DELETED
+  SCREENING_STARTED
+  SCREENING_COMPLETED
+  SCREENING_FAILED
+  MESSAGE_SENT
+  MESSAGE_DELIVERED
+  MESSAGE_FAILED
+  MESSAGE_RECEIVED
+  RETRY_ENQUEUED
+  RETRY_SUCCEEDED
+  RETRY_DEAD_LETTERED
+  WEBHOOK_RECEIVED
+  WEBHOOK_PROCESSED
+  WEBHOOK_FAILED
+  USER_LOGGED_IN
+  USER_LOGGED_OUT
+  USER_CREATED
+  PASSWORD_RESET_REQUESTED
+  PASSWORD_RESET_COMPLETED
+}
+
+// ─────────────────────────────────────────
+// AUTHENTICATION
+// ─────────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String
+  passwordHash  String
+  role          UserRole  @default(RECRUITER)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
+
+  candidates          Candidate[]
+  auditLogs           AuditLog[]
+  passwordResetTokens PasswordResetToken[]
+
+  @@index([email])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  token     String    @unique // hashed
+  userId    String
+  expiresAt DateTime  @db.Timestamptz(3)
+  usedAt    DateTime? @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────
+// CANDIDATES
+// ─────────────────────────────────────────
+
+model Candidate {
+  id          String          @id @default(cuid())
+  recruiterId String
+  name        String
+  phone       String          // E.164 format
+  role        String          // Job role they applied for
+  status      CandidateStatus @default(PENDING)
+  notes       String?
+  deletedAt   DateTime?       @db.Timestamptz(3) // Soft delete
+  createdAt   DateTime        @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime        @updatedAt @db.Timestamptz(3)
+
+  recruiter    User          @relation(fields: [recruiterId], references: [id])
+  screenings   Screening[]
+  conversation Conversation?
+  auditLogs    AuditLog[]
+
+  // Phone must be unique per recruiter
+  @@unique([recruiterId, phone])
+  @@index([recruiterId])
+  @@index([status])
+  @@index([phone])
+  @@index([createdAt])
+  @@index([deletedAt])
+}
+
+// ─────────────────────────────────────────
+// SCREENING WORKFLOW
+// ─────────────────────────────────────────
+
+model Screening {
+  id                   String         @id @default(cuid())
+  candidateId          String
+  state                ScreeningState @default(PENDING)
+  currentQuestionIndex Int            @default(0)
+  startedAt            DateTime?      @db.Timestamptz(3)
+  completedAt          DateTime?      @db.Timestamptz(3)
+  failedAt             DateTime?      @db.Timestamptz(3)
+  failureReason        String?
+  createdAt            DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt            DateTime       @updatedAt @db.Timestamptz(3)
+
+  candidate  Candidate           @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  responses  ScreeningResponse[]
+
+  @@index([candidateId])
+  @@index([state])
+  @@index([createdAt])
+}
+
+model ScreeningQuestion {
+  id         String   @id @default(cuid())
+  orderIndex Int      @unique  // 0-based; drives state machine progression
+  prompt     String   // The SMS text sent to the candidate
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @db.Timestamptz(3)
+
+  responses ScreeningResponse[]
+
+  @@index([orderIndex])
+  @@index([active])
+}
+
+model ScreeningResponse {
+  id                String    @id @default(cuid())
+  screeningId       String
+  questionId        String
+  rawText           String    // The raw SMS reply from the candidate
+  receivedMessageId String?   @unique // FK to Message for tracing (unique: one message = one response)
+  createdAt         DateTime  @default(now()) @db.Timestamptz(3)
+
+  screening Screening         @relation(fields: [screeningId], references: [id], onDelete: Cascade)
+  question  ScreeningQuestion @relation(fields: [questionId], references: [id])
+  message   Message?          @relation(fields: [receivedMessageId], references: [id], onDelete: SetNull)
+
+  @@index([screeningId])
+  @@index([questionId])
+}
+
+// ─────────────────────────────────────────
+// CONVERSATIONS & MESSAGES
+// ─────────────────────────────────────────
+
+model Conversation {
+  id          String   @id @default(cuid())
+  candidateId String   @unique
+  linqChatId  String   @unique  // Linq's chat ID
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  candidate Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  messages  Message[]
+
+  @@index([linqChatId])
+}
+
+model Message {
+  id             String           @id @default(cuid())
+  conversationId String
+  direction      MessageDirection
+  body           String
+  linqMessageId  String?          @unique // Linq's message ID
+  idempotencyKey String?          @unique // Set on outbound for retry safety
+  status         MessageStatus    @default(PENDING)
+  errorCode      String?
+  errorReason    String?
+  sentAt         DateTime?        @db.Timestamptz(3)
+  deliveredAt    DateTime?        @db.Timestamptz(3) // iMessage/RCS only
+  readAt         DateTime?        @db.Timestamptz(3) // iMessage only
+  failedAt       DateTime?        @db.Timestamptz(3)
+  createdAt      DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime         @updatedAt @db.Timestamptz(3)
+
+  conversation      Conversation       @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  events            MessageEvent[]
+  retryJobs         RetryJob[]
+  screeningResponse ScreeningResponse?
+
+  @@index([conversationId])
+  @@index([linqMessageId])
+  @@index([status])
+  @@index([direction])
+  @@index([createdAt])
+}
+
+model MessageEvent {
+  id        String        @id @default(cuid())
+  messageId String
+  status    MessageStatus
+  metadata  Json?         // Raw webhook payload excerpt
+  createdAt DateTime      @default(now()) @db.Timestamptz(3)
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────
+// WEBHOOK EVENTS
+// ─────────────────────────────────────────
+
+model WebhookEvent {
+  id               String             @id @default(cuid())
+  linqEventId      String             @unique  // webhook-id header; uniqueness = idempotency
+  eventType        String
+  status           WebhookEventStatus @default(RECEIVED)
+  rawPayload       Json               // Full raw body — never discard
+  processedPayload Json?              // Parsed/normalized version
+  errorMessage     String?
+  processedAt      DateTime?          @db.Timestamptz(3)
+  createdAt        DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime           @updatedAt @db.Timestamptz(3)
+
+  @@index([linqEventId])
+  @@index([eventType])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────
+// RETRY JOBS
+// ─────────────────────────────────────────
+
+model RetryJob {
+  id          String         @id @default(cuid())
+  messageId   String
+  attempt     Int            @default(1)
+  maxAttempts Int            @default(5)
+  nextRunAt   DateTime       @db.Timestamptz(3) // When to next attempt this job
+  status      RetryJobStatus @default(PENDING)
+  lastError   String?
+  runAt       DateTime?      @db.Timestamptz(3) // Actual execution time of last attempt
+  createdAt   DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime       @updatedAt @db.Timestamptz(3)
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+  @@index([status])
+  @@index([nextRunAt])   // Critical: cron queries by this
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────
+// AUDIT LOG
+// ─────────────────────────────────────────
+
+model AuditLog {
+  id          String      @id @default(cuid())
+  actorId     String?     // User ID (null for system actions)
+  candidateId String?     // Direct FK — null if candidate deleted or not applicable
+  action      AuditAction
+  entityType  String      // "Candidate", "Screening", "Message", ...
+  entityId    String
+  metadata    Json?       // Action-specific contextual data
+  requestId   String?     // Correlation ID from originating request
+  createdAt   DateTime    @default(now()) @db.Timestamptz(3)
+
+  actor     User?      @relation(fields: [actorId], references: [id])
+  candidate Candidate? @relation(fields: [candidateId], references: [id], onDelete: SetNull)
+
+  @@index([actorId])
+  @@index([candidateId])
+  @@index([entityType, entityId])
+  @@index([action])
+  @@index([createdAt])
+}
